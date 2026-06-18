@@ -1,0 +1,215 @@
+name: Build and Release Python App
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'main'
+      - 'master'
+    paths-ignore:
+      - '**.md'
+      - '**.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.artifact-name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact-name: Linux-x86_64
+            target-type: linux
+
+          - os: windows-latest
+            artifact-name: Windows-x64
+            target-type: windows
+
+          - os: macos-latest
+            artifact-name: macOS-Universal
+            target-type: macos
+
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install System Tkinter Dependencies (Linux Only)
+        if: ${{ matrix.target-type == 'linux' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller customtkinter pillow pyqrcode pypng
+
+      # --- Build Binary Assets with your precise hidden-import tracking flags ---
+      # Windows / Linux compiler route
+      - name: Run PyInstaller (Windows / Linux)
+        if: ${{ matrix.target-type != 'macos' }}
+        shell: python
+        run: |
+          import os
+          import subprocess
+          
+          script_name = "main.py" if os.path.exists("main.py") else "frontend.py"
+          
+          # Integrated your explicit PIL tracking flags for absolute execution safety
+          command = [
+              "pyinstaller", 
+              "--noconsole", 
+              "--onefile",
+              "--hidden-import=PIL",
+              "--hidden-import=PIL._imagingtk",
+              "--hidden-import=PIL._tkinter_finder"
+          ]
+          
+          if os.path.exists("app_icon.png"):
+              command.extend(["--add-data", "app_icon.png;."])
+              
+          command.append(script_name)
+          subprocess.run(command, check=True)
+
+      # macOS build bundle route
+      - name: Run PyInstaller (macOS App Bundle)
+        if: ${{ matrix.target-type == 'macos' }}
+        shell: python
+        run: |
+          import os
+          import subprocess
+          
+          script_name = "main.py" if os.path.exists("main.py") else "frontend.py"
+          
+          command = [
+              "pyinstaller", 
+              "--noconsole", 
+              "--onefile", 
+              "--windowed",
+              "--hidden-import=PIL",
+              "--hidden-import=PIL._imagingtk",
+              "--hidden-import=PIL._tkinter_finder"
+          ]
+          
+          if os.path.exists("app_icon.png"):
+              command.extend(["--add-data", "app_icon.png:."])
+              
+          command.append(script_name)
+          subprocess.run(command, check=True)
+
+      
+      
+
+      # --- Custom Packaging Blocks ---
+      - name: Package AppImage (Linux)
+        if: ${{ matrix.target-type == 'linux' }}
+        run: |
+          # 1. Install the packaging tool natively via apt-get to avoid ALL broken download URLs
+          sudo apt-get update
+          sudo apt-get install -y appstream desktop-file-utils binutils
+          
+          # Download the stable appimagetool release via an official, validated third-party software container
+          sudo wget -O /usr/local/bin/appimagetool https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          sudo chmod +x /usr/local/bin/appimagetool
+          
+          # Extract it instantly to bypass cloud FUSE virtualization limits
+          cd /usr/local/bin
+          sudo ./appimagetool --appimage-extract
+          sudo ln -sf /usr/local/bin/squashfs-root/AppRun /usr/local/bin/appimagetool_run
+          cd $GITHUB_WORKSPACE
+          
+          # 2. Build the AppDir workspace structure
+          rm -rf AppDir
+          mkdir -p AppDir/usr/bin
+          
+          # Copy your compiled PyInstaller asset safely into place
+          cp dist/main AppDir/usr/bin/qr-generator 2>/dev/null || cp dist/frontend AppDir/usr/bin/qr-generator
+          chmod +x AppDir/usr/bin/qr-generator
+          
+          # 3. Create the inner container system launcher file
+          cat << 'EOF' > AppDir/AppRun
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "${0}")")"
+          export PATH="${HERE}/usr/bin:${PATH}"
+          exec qr-generator "$@"
+          EOF
+          chmod +x AppDir/AppRun
+          
+          # 4. Create the system desktop menu shortcut entry file
+          cat << 'EOF' > AppDir/qr-generator.desktop
+          [Desktop Entry]
+          Type=Application
+          Name=QR Code Generator
+          Exec=qr-generator
+          Icon=qr-generator
+          Categories=Utility;
+          EOF
+          
+          # Generate a fallback system asset inside the layout folder
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+          touch AppDir/qr-generator.png
+          
+          # 5. Compile the final AppImage using the extracted binary engine
+          mkdir -p final_dist
+          ARCH=x86_64 /usr/local/bin/appimagetool_run AppDir final_dist/QR_Code_Generator-x86_64.AppImage
+
+
+
+
+      - name: Package DMG Container (macOS)
+        if: ${{ matrix.target-type == 'macos' }}
+        run: |
+          npm install -g appdmg
+          mkdir -p dist/dmg
+          cp -r dist/main.app dist/dmg/ 2>/dev/null || cp -r dist/frontend.app dist/dmg/
+          cat << 'EOF' > dmg_spec.json
+          {
+            "title": "QR Code Generator Installer",
+            "icon-size": 80,
+            "contents": [
+              { "x": 380, "y": 170, "type": "link", "path": "/Applications" },
+              { "x": 140, "y": 170, "type": "file", "path": "dist/dmg/main.app" }
+            ]
+          }
+          EOF
+          if [ ! -d "dist/dmg/main.app" ]; then
+            sed -i '' 's/main.app/frontend.app/g' dmg_spec.json
+          fi
+          mkdir -p final_dist
+          appdmg dmg_spec.json final_dist/QR_Code_Generator.dmg
+
+      - name: Format Artifact Output (Windows)
+        if: ${{ matrix.target-type == 'windows' }}
+        shell: bash
+        run: |
+          mkdir -p final_dist
+          if [ -f "dist/main.exe" ]; then
+            mv dist/main.exe final_dist/frontend.exe
+          else
+            mv dist/frontend.exe final_dist/frontend.exe
+          fi
+
+      # --- Automated Release Target Fetcher ---
+      - name: Create Draft and Upload to GitHub Releases
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          TARGET_FILE=$(ls final_dist/*)
+          VERSION_TAG="v1.0.4"
+          
+          if ! gh release view "$VERSION_TAG" > /dev/null 2>&1; then
+            gh release create "$VERSION_TAG" --draft --title "Release $VERSION_TAG" --notes "Automated Cross-Platform Compilation Assets"
+          fi
+          
+          gh release upload --clobber "$VERSION_TAG" "$TARGET_FILE"
+
