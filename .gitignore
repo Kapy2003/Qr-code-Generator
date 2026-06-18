@@ -1,3 +1,4 @@
 /qr-generated
 .git
 .venv
+__pycache__/*
